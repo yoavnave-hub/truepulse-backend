@@ -21,24 +21,24 @@ serve(async (req) => {
   const receivedAt = new Date().toISOString();
 
   try {
-    // 1. Ingest Secret check
+    // 1. Secret check
     const secret = req.headers.get("x-ingest-secret");
     if (!secret || secret !== Deno.env.get("INGEST_SECRET")) {
       return json({ error: "unauthorized" }, 401);
     }
 
-    // 2. Validate client hash header format
+    // 2. Validate client hash format
     const clientHash = (req.headers.get("x-client-sha256") ?? "").toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(clientHash)) {
       return json({ error: "missing or malformed x-client-sha256 header" }, 400);
     }
 
-    // 3. Inspect binary payload
+    // 3. Inspect payload
     const bytes = await req.arrayBuffer();
     if (bytes.byteLength === 0) return json({ error: "empty payload" }, 400);
     if (bytes.byteLength > MAX_BYTES) return json({ error: "payload too large (max 50MB)" }, 413);
 
-    // 4. Validate MP4 container header (ftyp box at byte offset 4-8)
+    // 4. Validate MP4 container structure (ftyp box at byte offset 4-8)
     if (bytes.byteLength < 12) {
       return json({ error: "payload too small to be valid video container" }, 415);
     }
@@ -48,13 +48,13 @@ serve(async (req) => {
       return json({ error: "invalid container: missing mp4 ftyp box" }, 415);
     }
 
-    // 5. Calculate server SHA-256 digest
+    // 5. Compute server SHA-256 digest
     const digest = await crypto.subtle.digest("SHA-256", bytes);
     const serverHash = [...new Uint8Array(digest)]
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
 
-    // 6. Assert client claim matches byte digest
+    // 6. Assert client claim matches server digest
     if (serverHash !== clientHash) {
       return json({ error: "hash mismatch", server: serverHash, client: clientHash }, 409);
     }
@@ -66,7 +66,7 @@ serve(async (req) => {
 
     const path = `${serverHash}.mp4`;
 
-    // 7. Idempotency check: if row already exists, return row with signed URL
+    // 7. Idempotency check: if row already exists, return with signed URL
     const { data: existing } = await supabase
       .from("clips")
       .select("id, sha256_hash, file_path, received_at")
@@ -88,7 +88,7 @@ serve(async (req) => {
       });
     }
 
-    // 8. Storage Upload: ignore 'already exists' error to survive partial-failure retries
+    // 8. Storage Upload: verify bytes on storage collision
     const { error: uploadError } = await supabase.storage
       .from("raw-clips")
       .upload(path, bytes, { contentType: "video/mp4", upsert: false });
@@ -99,12 +99,35 @@ serve(async (req) => {
         (uploadError as any).statusCode === "409" ||
         (uploadError as any).status === 409;
 
-      if (!isAlreadyExists) {
+      if (isAlreadyExists) {
+        // Defensive check: pull existing object and verify its SHA-256
+        const { data: downloadedBlob } = await supabase.storage
+          .from("raw-clips")
+          .download(path);
+
+        let storedBytesValid = false;
+        if (downloadedBlob) {
+          const storedBuf = await downloadedBlob.arrayBuffer();
+          const storedDigest = await crypto.subtle.digest("SHA-256", storedBuf);
+          const storedHash = [...new Uint8Array(storedDigest)]
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+          if (storedHash === serverHash) storedBytesValid = true;
+        }
+
+        // Overwrite if corrupt or truncated
+        if (!storedBytesValid) {
+          const { error: overwriteError } = await supabase.storage
+            .from("raw-clips")
+            .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+          if (overwriteError) throw overwriteError;
+        }
+      } else {
         throw uploadError;
       }
     }
 
-    // 9. Insert verified database record
+    // 9. Insert row: handle concurrent insert race condition (Postgres 23505 unique violation)
     const { data, error: insertError } = await supabase
       .from("clips")
       .insert({
@@ -117,7 +140,32 @@ serve(async (req) => {
       .select()
       .single();
 
-    if (insertError) throw insertError;
+    if (insertError) {
+      // Postgres error code 23505 = unique_violation
+      if (insertError.code === "23505" || insertError.message?.includes("unique")) {
+        const { data: raceWinner } = await supabase
+          .from("clips")
+          .select("id, sha256_hash, file_path, received_at")
+          .eq("sha256_hash", serverHash)
+          .single();
+
+        if (raceWinner) {
+          const { data: signedWinner } = await supabase.storage
+            .from("raw-clips")
+            .createSignedUrl(raceWinner.file_path, 3600);
+
+          return json({
+            success: true,
+            duplicate: true,
+            clip_id: raceWinner.id,
+            sha256_hash: raceWinner.sha256_hash,
+            received_at: raceWinner.received_at,
+            signed_playback_url: signedWinner?.signedUrl ?? null,
+          });
+        }
+      }
+      throw insertError;
+    }
 
     // 10. Generate signed playback URL
     const { data: signedData } = await supabase.storage
