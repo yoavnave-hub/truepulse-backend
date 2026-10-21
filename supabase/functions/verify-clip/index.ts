@@ -21,7 +21,7 @@ serve(async (req) => {
   const receivedAt = new Date().toISOString();
 
   try {
-    // 1. Secret check
+    // 1. Auth check
     const secret = req.headers.get("x-ingest-secret");
     if (!secret || secret !== Deno.env.get("INGEST_SECRET")) {
       return json({ error: "unauthorized" }, 401);
@@ -33,12 +33,18 @@ serve(async (req) => {
       return json({ error: "missing or malformed x-client-sha256 header" }, 400);
     }
 
-    // 3. Inspect payload
+    // 3. Early memory guard: check Content-Length before buffering into RAM
+    const contentLength = req.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_BYTES) {
+      return json({ error: "payload too large (max 50MB)" }, 413);
+    }
+
+    // 4. Read binary payload with secondary size assertion
     const bytes = await req.arrayBuffer();
     if (bytes.byteLength === 0) return json({ error: "empty payload" }, 400);
     if (bytes.byteLength > MAX_BYTES) return json({ error: "payload too large (max 50MB)" }, 413);
 
-    // 4. Validate MP4 container structure (ftyp box at byte offset 4-8)
+    // 5. Container validation: MP4 ftyp box check at offset 4
     if (bytes.byteLength < 12) {
       return json({ error: "payload too small to be valid video container" }, 415);
     }
@@ -48,13 +54,13 @@ serve(async (req) => {
       return json({ error: "invalid container: missing mp4 ftyp box" }, 415);
     }
 
-    // 5. Compute server SHA-256 digest
+    // 6. Compute server SHA-256 digest
     const digest = await crypto.subtle.digest("SHA-256", bytes);
     const serverHash = [...new Uint8Array(digest)]
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
 
-    // 6. Assert client claim matches server digest
+    // 7. Enforce transit verification
     if (serverHash !== clientHash) {
       return json({ error: "hash mismatch", server: serverHash, client: clientHash }, 409);
     }
@@ -66,7 +72,7 @@ serve(async (req) => {
 
     const path = `${serverHash}.mp4`;
 
-    // 7. Idempotency check: if row already exists, return with signed URL
+    // 8. Idempotency check with missing-storage fallback
     const { data: existing } = await supabase
       .from("clips")
       .select("id, sha256_hash, file_path, received_at")
@@ -78,17 +84,21 @@ serve(async (req) => {
         .from("raw-clips")
         .createSignedUrl(existing.file_path, 3600);
 
-      return json({
-        success: true,
-        duplicate: true,
-        clip_id: existing.id,
-        sha256_hash: existing.sha256_hash,
-        received_at: existing.received_at,
-        signed_playback_url: signedExisting?.signedUrl ?? null,
-      });
+      // If the row exists and storage file is intact, return duplicate
+      if (signedExisting?.signedUrl) {
+        return json({
+          success: true,
+          duplicate: true,
+          clip_id: existing.id,
+          sha256_hash: existing.sha256_hash,
+          received_at: existing.received_at,
+          signed_playback_url: signedExisting.signedUrl,
+        });
+      }
+      // If signedUrl is null (storage object missing), fall through to re-upload below
     }
 
-    // 8. Storage Upload: verify bytes on storage collision
+    // 9. Storage Upload: verify bytes on storage collision
     const { error: uploadError } = await supabase.storage
       .from("raw-clips")
       .upload(path, bytes, { contentType: "video/mp4", upsert: false });
@@ -100,7 +110,6 @@ serve(async (req) => {
         (uploadError as any).status === 409;
 
       if (isAlreadyExists) {
-        // Defensive check: pull existing object and verify its SHA-256
         const { data: downloadedBlob } = await supabase.storage
           .from("raw-clips")
           .download(path);
@@ -115,7 +124,6 @@ serve(async (req) => {
           if (storedHash === serverHash) storedBytesValid = true;
         }
 
-        // Overwrite if corrupt or truncated
         if (!storedBytesValid) {
           const { error: overwriteError } = await supabase.storage
             .from("raw-clips")
@@ -127,58 +135,64 @@ serve(async (req) => {
       }
     }
 
-    // 9. Insert row: handle concurrent insert race condition (Postgres 23505 unique violation)
-    const { data, error: insertError } = await supabase
-      .from("clips")
-      .insert({
-        sha256_hash: serverHash,
-        file_path: path,
-        file_size_bytes: bytes.byteLength,
-        status: "verified",
-        received_at: receivedAt,
-      })
-      .select()
-      .single();
+    // 10. Database write with concurrent race-condition handling (Postgres 23505)
+    let clipId = existing?.id;
+    let finalReceivedAt = existing?.received_at ?? receivedAt;
 
-    if (insertError) {
-      // Postgres error code 23505 = unique_violation
-      if (insertError.code === "23505" || insertError.message?.includes("unique")) {
-        const { data: raceWinner } = await supabase
-          .from("clips")
-          .select("id, sha256_hash, file_path, received_at")
-          .eq("sha256_hash", serverHash)
-          .single();
+    if (!existing) {
+      const { data, error: insertError } = await supabase
+        .from("clips")
+        .insert({
+          sha256_hash: serverHash,
+          file_path: path,
+          file_size_bytes: bytes.byteLength,
+          status: "verified",
+          received_at: receivedAt,
+        })
+        .select()
+        .single();
 
-        if (raceWinner) {
-          const { data: signedWinner } = await supabase.storage
-            .from("raw-clips")
-            .createSignedUrl(raceWinner.file_path, 3600);
+      if (insertError) {
+        if (insertError.code === "23505" || insertError.message?.includes("unique")) {
+          const { data: raceWinner } = await supabase
+            .from("clips")
+            .select("id, sha256_hash, file_path, received_at")
+            .eq("sha256_hash", serverHash)
+            .single();
 
-          return json({
-            success: true,
-            duplicate: true,
-            clip_id: raceWinner.id,
-            sha256_hash: raceWinner.sha256_hash,
-            received_at: raceWinner.received_at,
-            signed_playback_url: signedWinner?.signedUrl ?? null,
-          });
+          if (raceWinner) {
+            const { data: signedWinner } = await supabase.storage
+              .from("raw-clips")
+              .createSignedUrl(raceWinner.file_path, 3600);
+
+            return json({
+              success: true,
+              duplicate: true,
+              clip_id: raceWinner.id,
+              sha256_hash: raceWinner.sha256_hash,
+              received_at: raceWinner.received_at,
+              signed_playback_url: signedWinner?.signedUrl ?? null,
+            });
+          }
         }
+        throw insertError;
       }
-      throw insertError;
+      clipId = data.id;
+      finalReceivedAt = data.received_at;
     }
 
-    // 10. Generate signed playback URL
+    // 11. Generate signed playback URL
     const { data: signedData } = await supabase.storage
       .from("raw-clips")
       .createSignedUrl(path, 3600);
 
     return json({
       success: true,
-      duplicate: false,
-      clip_id: data.id,
+      duplicate: Boolean(existing),
+      clip_id: clipId,
       sha256_hash: serverHash,
       file_size_bytes: bytes.byteLength,
-      received_at: data.received_at,
+      received_at: finalReceivedAt,
       signed_playback_url: signedData?.signedUrl ?? null,
     });
   } catch (err: any) {
